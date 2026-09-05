@@ -260,9 +260,12 @@ def finalize(
         raise PublishError(str(exc), EXIT_FINALIZE, exc.detail) from None
 
 
-def pair(base_url: str, name: str) -> str:
+def pair(base_url: str, name: str, *, scopes: list[str] | None = None) -> str:
     """Run the device-code pairing and return the new API key."""
-    started = request("POST", f"{base_url}/v1/auth/agent/request-code", {"name": name})
+    body = {"name": name}
+    if scopes is not None:
+        body["scopes"] = scopes
+    started = request("POST", f"{base_url}/v1/auth/agent/request-code", body)
     log("")
     log("Codev needs your approval to create an API key for this agent.")
     log(f"  Open:  {started['verify_url']}")

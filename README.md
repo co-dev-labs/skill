@@ -2,6 +2,7 @@
 
 Codev publishes static sites and single-page apps to a public URL, for people and for AI agents.
 This skill teaches Claude Code, Cursor and Codex to build a site, publish it, and manage it afterwards.
+New websites use React + Vite with TypeScript by default, including landing pages and portfolios; Codev hosts their production build while the editable source stays in the project.
 
 ## Install
 
@@ -21,6 +22,11 @@ You can also create a key on the dashboard at https://co.dev and set it as `CODE
 
 - `skills/codev/SKILL.md` is the instructions the agent follows.
 - `skills/codev/publish.py` is a standard library Python 3.10+ script that runs the publish protocol, and it works by hand too.
+- `skills/codev/project.py` and its companion Python modules save private React/Vite source revisions, reopen projects by domain, build saved snapshots, and restore previous iterations without Git.
+
+Source projects need a server with source storage enabled and a key explicitly authorized for `sources:read` and `sources:write`.
+Run `project.py pair` to request those permissions.
+Opening a domain downloads source into a fresh directory; it never executes project scripts or overwrites an existing workspace.
 
 ## Configuration
 
