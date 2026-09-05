@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Publish a folder of static files to Codev and print its URL.
 
-Standard library only, Python 3.10 or newer, no installation needed.
+Python 3.10 or newer. Explicit environment credentials need no dependencies;
+interactive connections prepare an isolated native credential-store helper.
 
     python3 publish.py ./dist --spa
     python3 publish.py ./dist --site <site id> --base-version <version id>
     python3 publish.py ./dist --pair
 
 Environment:
-    CODEV_API_KEY   an API key (ck_live_...); without one the site is
-                    anonymous, expires in 24 hours and prints a claim URL
+    CODEV_API_KEY   optional explicit automation credential; otherwise reuse
+                    the saved connection, or connect once with --connect
     CODEV_API_URL   the API origin (default: https://api.co.dev)
 
 Exit codes: 0 ok, 1 unexpected error, 2 usage or folder problem, 3 not
@@ -27,6 +28,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
@@ -123,6 +125,8 @@ def request(
     timeout: int = REQUEST_TIMEOUT,
 ):
     """JSON request; returns the parsed body. Raises ApiError on 4xx/5xx."""
+    from auth import NoRedirect
+
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Accept": "application/json"}
     if data is not None:
@@ -131,7 +135,9 @@ def request(
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        with urllib.request.build_opener(NoRedirect).open(
+            req, timeout=timeout
+        ) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
         raw = exc.read()
@@ -152,6 +158,29 @@ def content_type_for(path: Path) -> str:
         return known
     guessed, _ = mimetypes.guess_type(path.name)
     return guessed or "application/octet-stream"
+
+
+def source_project_root(directory: Path) -> Path | None:
+    """Recognize source projects before an output upload loses edit history."""
+    for candidate in (directory, *directory.parents):
+        if (candidate / ".codev" / "project.json").is_file():
+            return candidate
+        package = candidate / "package.json"
+        if package.is_file():
+            try:
+                data = json.loads(package.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = {}
+            if isinstance(data, dict):
+                dependencies = set()
+                for field in ("dependencies", "devDependencies"):
+                    if isinstance(data.get(field), dict):
+                        dependencies.update(data[field])
+                if {"react", "vite"} <= dependencies:
+                    return candidate
+        if (candidate / ".git").exists():
+            break
+    return None
 
 
 def build_manifest(directory: Path) -> list[dict]:
@@ -248,45 +277,37 @@ def upload_all(uploads: list[dict], directory: Path, concurrency: int) -> None:
 
 
 def finalize(
-    base_url: str, finalize_url: str, token: str | None, base_version: str | None
+    base_url: str,
+    finalize_url: str,
+    token: str | None,
+    base_version: str | None,
+    *,
+    activate: bool = True,
 ) -> dict:
     url = finalize_url if finalize_url.startswith("http") else base_url + finalize_url
-    body = {"base_version_id": base_version} if base_version else None
+    if (
+        urllib.parse.urlsplit(url).netloc != urllib.parse.urlsplit(base_url).netloc
+        or urllib.parse.urlsplit(url).scheme != urllib.parse.urlsplit(base_url).scheme
+    ):
+        raise PublishError(
+            "The finalize URL does not belong to the trusted Codev API.", EXIT_AUTH
+        )
+    body = {"base_version_id": base_version} if base_version else {}
+    if not activate:
+        body["activate"] = False
     try:
-        return request("POST", url, body, token)
+        return request("POST", url, body or None, token)
     except ApiError as exc:
-        if exc.exit_code == EXIT_CONFLICT:
+        if exc.exit_code in (EXIT_CONFLICT, EXIT_AUTH):
             raise
         raise PublishError(str(exc), EXIT_FINALIZE, exc.detail) from None
 
 
 def pair(base_url: str, name: str, *, scopes: list[str] | None = None) -> str:
-    """Run the device-code pairing and return the new API key."""
-    body = {"name": name}
-    if scopes is not None:
-        body["scopes"] = scopes
-    started = request("POST", f"{base_url}/v1/auth/agent/request-code", body)
-    log("")
-    log("Codev needs your approval to create an API key for this agent.")
-    log(f"  Open:  {started['verify_url']}")
-    log(f"  Code:  {started['user_code']}")
-    log("")
-    deadline = time.time() + started.get("expires_in", 600)
-    interval = max(1, int(started.get("poll_interval", 5)))
-    while time.time() < deadline:
-        time.sleep(interval)
-        result = request(
-            "POST",
-            f"{base_url}/v1/auth/agent/exchange",
-            {"pairing_id": started["pairing_id"]},
-        )
-        status = result.get("status")
-        if status == "approved":
-            log("Approved. Save the key below as CODEV_API_KEY.")
-            return result["api_key"]
-        if status != "pending":
-            raise PublishError(f"Pairing {status}", EXIT_PAIRING)
-    raise PublishError("Pairing expired before it was approved", EXIT_PAIRING)
+    """Compatibility helper: connect securely and keep the credential internal."""
+    from auth import get_token
+
+    return get_token(base_url, connect=True, name=name)
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -311,11 +332,41 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--base-url", help="API origin (or CODEV_API_URL)")
     parser.add_argument("--api-key", help="API key (or CODEV_API_KEY)")
     parser.add_argument(
+        "--connect",
+        action="store_true",
+        help="connect once if no usable saved connection exists",
+    )
+    parser.add_argument(
+        "--temporary", action="store_true", help="use a connection only in this process"
+    )
+    parser.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="open the connection link in the default browser",
+    )
+    parser.add_argument("--account", help="choose a saved Codev account")
+    parser.add_argument("--task", help="short action label for the consent page")
+    parser.add_argument(
+        "--claim-token-stdin",
+        action="store_true",
+        help="read anonymous-site save proof from stdin",
+    )
+    parser.add_argument(
         "--pair",
         action="store_true",
-        help="obtain an API key first by pairing with a signed-in human",
+        help="alias for --connect; reuse or securely remember an agent connection",
+    )
+    parser.add_argument(
+        "--output-only",
+        action="store_true",
+        help="explicitly publish built files without saving editable source",
     )
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="prepare a preview without changing the live version",
+    )
     parser.add_argument(
         "--json", action="store_true", help="print one JSON object instead of lines"
     )
@@ -323,18 +374,67 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from auth import (
+        AuthError,
+        event,
+        get_token,
+    )
+    from auth import request as auth_request
+    from auth import (
+        trusted_origin,
+    )
+
     args = parse_args(argv)
     try:
-        base_url = api_url(args.base_url)
-        token = args.api_key or os.environ.get("CODEV_API_KEY") or None
-        result: dict = {}
-
-        if args.pair and not token:
-            token = pair(base_url, args.name or "Claude Code")
-            result["api_key"] = token
-
+        base_url = trusted_origin(api_url(args.base_url))
         directory = Path(args.directory).resolve()
+        source_root = source_project_root(directory)
+        if source_root is not None and (
+            source_root == directory or not args.output_only
+        ):
+            raise PublishError(
+                "This is a React/Vite or saved source project. Use project.py init, save, "
+                "build --trust, and publish from its source root so the site can be edited "
+                "on another computer. For an intentional built-files-only upload, publish "
+                "the output folder with --output-only; it will not save source.",
+                EXIT_USAGE,
+            )
         files = build_manifest(directory)
+        if args.site and not args.base_version and not args.preview:
+            raise PublishError(
+                "Pass --base-version from the site's state before editing. Resolve the site first; do not overwrite intervening changes.",
+                EXIT_USAGE,
+            )
+        site_url = (
+            args.site
+            if args.site and ("://" in args.site or "." in args.site)
+            else None
+        )
+        token = get_token(
+            base_url,
+            explicit=args.api_key,
+            connect=args.connect or args.pair,
+            temporary=args.temporary,
+            open_browser=args.open_browser,
+            account=args.account,
+            site=site_url,
+            task=args.task,
+            name="Coding agent",
+            claim_token=sys.stdin.read(512).strip() if args.claim_token_stdin else None,
+        )
+        result: dict = {}
+        if args.site and not token:
+            raise AuthError(
+                "authorization_required",
+                "Connect Codev once with --connect to update this site. An already claimed site does not need to be claimed again.",
+            )
+        if site_url:
+            resolved = auth_request(
+                base_url,
+                "/v1/sites/lookup?" + urllib.parse.urlencode({"url": site_url}),
+                token=token,
+            )
+            args.site = resolved["site"]["id"]
         log(f"Hashed {len(files)} files in {directory}")
 
         created = request_manifest(
@@ -356,9 +456,13 @@ def main(argv: list[str] | None = None) -> int:
 
         finalize_token = token or created.get("publish_token")
         finalized = finalize(
-            base_url, created["finalize_url"], finalize_token, args.base_version
+            base_url,
+            created["finalize_url"],
+            finalize_token,
+            args.base_version,
+            activate=not args.preview,
         )
-        log("Published.")
+        log("Preview ready." if args.preview else "Published.")
 
         result.update(
             {
@@ -373,6 +477,14 @@ def main(argv: list[str] | None = None) -> int:
             result["claim_url"] = created["claim_url"]
             result["expires_at"] = created.get("expires_at")
             log("This site is anonymous and expires in 24 hours unless claimed.")
+    except AuthError as exc:
+        event(exc.code, message=str(exc), **exc.detail)
+        return (
+            EXIT_PAIRING
+            if exc.code
+            in ("connection_denied", "connection_cancelled", "connection_expired")
+            else EXIT_AUTH
+        )
     except PublishError as exc:
         log(f"Error: {exc}")
         if exc.detail.get("current_version_id"):
@@ -392,7 +504,6 @@ def main(argv: list[str] | None = None) -> int:
             "preview_url",
             "claim_url",
             "expires_at",
-            "api_key",
         ):
             if result.get(key):
                 print(f"{key}={result[key]}")

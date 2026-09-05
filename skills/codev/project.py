@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Save, reopen, build, and restore React/Vite projects without Git.
 
-Python 3.10+, standard library only. Install the companion modules beside
-this script. Credentials come only from CODEV_API_KEY, never project files.
+Python 3.10+. Install the companion modules beside this script.
+Credentials come from the OS store or explicit CODEV_API_KEY, never project files.
 """
 
 from __future__ import annotations
@@ -16,13 +16,13 @@ import tempfile
 import urllib.parse
 from pathlib import Path
 
+from auth import EDITING_SCOPES, AuthError, event, get_token
+from auth import request as auth_request
 from project_api import ProjectAPI, upload_verified
 from project_build import run_build, tool_version
 from project_files import validate_path
 from project_workspace import Workspace, materialize
-from publish import PublishError, api_url, pair
-
-SOURCE_SCOPES = ["sites:read", "sites:write", "sources:read", "sources:write"]
+from publish import PublishError, api_url
 
 
 def save(api, workspace: Workspace, summary: str) -> dict:
@@ -126,10 +126,30 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--api", help="Codev API origin")
     result.add_argument(
+        "--connect",
+        action="store_true",
+        help="reuse a saved connection or connect once",
+    )
+    result.add_argument("--account", help="choose a saved Codev account")
+    result.add_argument("--temporary", action="store_true")
+    result.add_argument("--open-browser", action="store_true")
+    result.add_argument(
+        "--task", help="short action label shown with connection consent"
+    )
+    result.add_argument(
+        "--claim-token-stdin",
+        action="store_true",
+        help="read existing anonymous-site save proof from stdin",
+    )
+    result.add_argument(
         "--directory", type=Path, default=Path.cwd(), help="local project root"
     )
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("pair", help="request explicit approval for source access")
+    resolve = commands.add_parser(
+        "resolve", help="identify an owned site even when source storage is disabled"
+    )
+    resolve.add_argument("url")
     init = commands.add_parser(
         "init", help="attach and save an existing React/Vite project"
     )
@@ -175,22 +195,74 @@ def main(argv=None) -> int:
     args = parser().parse_args(argv)
     try:
         workspace = Workspace(args.directory)
-        origin = api_url(args.api or workspace.state.get("api_origin"))
-        if args.command == "pair":
-            print(pair(origin, "Claude Code source projects", scopes=SOURCE_SCOPES))
-            return 0
-        token = os.environ.get("CODEV_API_KEY")
-        if not token:
+        origin = api_url(args.api)
+        if (
+            workspace.state.get("api_origin")
+            and workspace.state["api_origin"] != origin
+        ):
             raise ValueError(
-                "Set CODEV_API_KEY to a key with source access, or run project.py pair."
+                "This workspace belongs to a different Codev API. Select its trusted origin explicitly with --api."
+            )
+        if args.command in ("init", "open"):
+            capability = auth_request(origin, "/v1/capabilities")["source_projects"]
+            available = (
+                capability["enabled"]
+                if args.command == "init"
+                else capability["downloads_enabled"]
+            )
+            if not available:
+                raise ValueError(
+                    "Private source storage is not available on this Codev server. "
+                    "Configure a separate R2_SOURCE_BUCKET with object read/write access; "
+                    "enable SOURCES_ENABLED to save projects. Reconnecting cannot enable storage."
+                )
+        if args.command == "pair":
+            get_token(
+                origin,
+                connect=True,
+                account=args.account,
+                open_browser=args.open_browser,
+                required_scopes=EDITING_SCOPES,
+            )
+            print(json.dumps({"status": "connected"}))
+            return 0
+        site = (
+            args.url
+            if args.command in ("open", "resolve")
+            else getattr(args, "site", None) or workspace.state.get("site_url")
+        )
+        token = get_token(
+            origin,
+            connect=args.connect,
+            account=args.account,
+            site=site,
+            task=args.task,
+            temporary=args.temporary,
+            open_browser=args.open_browser,
+            claim_token=sys.stdin.read(512).strip() if args.claim_token_stdin else None,
+            required_scopes=(
+                ()
+                if args.command == "resolve"
+                else (
+                    {"sites:read", "sources:read"}
+                    if args.command in ("open", "status", "history")
+                    else EDITING_SCOPES
+                )
+            ),
+        )
+        if not token:
+            raise AuthError(
+                "authorization_required",
+                "Connect Codev once with --connect. Browser sign-in and claiming are only requested if needed.",
             )
         api = ProjectAPI(origin, token)
-        if args.command == "open":
+        if args.command == "resolve":
+            result = api.get(
+                "/v1/sites/lookup?" + urllib.parse.urlencode({"url": args.url})
+            )
+        elif args.command == "open":
             result = open_project(api, args.url, args.destination, args.revision)
         elif args.command == "init":
-            capability = api.get("/v1/capabilities")["source_projects"]
-            if not capability["enabled"]:
-                raise ValueError("Source projects are not enabled on this server.")
             result = initialize(api, workspace, args)
         else:
             state = workspace.require()
@@ -259,6 +331,9 @@ def main(argv=None) -> int:
                 }
         print(json.dumps(result, indent=2))
         return 0
+    except AuthError as exc:
+        event(exc.code, message=str(exc), **exc.detail)
+        return 3
     except PublishError as exc:
         print(str(exc), file=sys.stderr)
         if exc.detail:
