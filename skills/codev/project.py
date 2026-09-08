@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -19,8 +18,8 @@ from pathlib import Path
 from auth import EDITING_SCOPES, AuthError, event, get_token
 from auth import request as auth_request
 from project_api import ProjectAPI, upload_verified
-from project_build import run_build, tool_version
-from project_files import validate_path
+from project_build import review_build, run_build, tool_version
+from project_files import read_backend, validate_path
 from project_workspace import Workspace, materialize
 from publish import PublishError, api_url
 
@@ -28,6 +27,7 @@ from publish import PublishError, api_url
 def save(api, workspace: Workspace, summary: str) -> dict:
     state = workspace.require()
     files = workspace.files()
+    backend = read_backend(workspace.root)
     body = {
         "parent_revision_id": state["revision_id"],
         "expected_generation": state["state_generation"],
@@ -35,6 +35,8 @@ def save(api, workspace: Workspace, summary: str) -> dict:
         "build_config": state["build_config"],
         "files": files,
     }
+    if backend is not None:
+        body["backend_definition"] = backend
     prepared = api.post(
         f'/v1/sites/{state["site_id"]}/revisions',
         body,
@@ -42,7 +44,7 @@ def save(api, workspace: Workspace, summary: str) -> dict:
     )
     # Refuse to upload bytes collected from a tree that changed while the
     # server prepared the upload. Finalization also verifies every digest.
-    if workspace.files() != files:
+    if workspace.files() != files or read_backend(workspace.root) != backend:
         raise ValueError("Source changed while saving. Retry after edits finish.")
     upload_verified(prepared["uploads"], files, workspace.root)
     saved = api.post(prepared["finalize_url"], {})
@@ -51,6 +53,8 @@ def save(api, workspace: Workspace, summary: str) -> dict:
             "revision_id": saved["revision"]["id"],
             "content_digest": saved["revision"]["content_digest"],
             "state_generation": saved["site"]["state_generation"],
+            "backend_definition": saved["revision"].get("backend_definition"),
+            "backend_local_definition": backend,
         }
     )
     workspace.write()
@@ -171,6 +175,10 @@ def parser() -> argparse.ArgumentParser:
         "--revision", help="live, latest, or an exact source revision id"
     )
     commands.add_parser("status")
+    commands.add_parser(
+        "review-build",
+        help="diff dependencies, scripts, and build inputs without executing them",
+    )
     saved = commands.add_parser("save")
     saved.add_argument("--summary", required=True)
     built = commands.add_parser(
@@ -213,7 +221,8 @@ def main(argv=None) -> int:
             if not available:
                 raise ValueError(
                     "Private source storage is not available on this Codev server. "
-                    "Configure a separate R2_SOURCE_BUCKET with object read/write access; "
+                    "Configure R2_SOURCE_BUCKET, R2_SOURCE_ACCESS_KEY_ID, and "
+                    "R2_SOURCE_SECRET_ACCESS_KEY with object read/write access; "
                     "enable SOURCES_ENABLED to save projects. Reconnecting cannot enable storage."
                 )
         if args.command == "pair":
@@ -280,6 +289,8 @@ def main(argv=None) -> int:
                 result = save(api, workspace, args.summary)
             elif args.command == "build":
                 result = run_build(api, workspace, trust=args.trust)
+            elif args.command == "review-build":
+                result = review_build(api, workspace)
             elif args.command == "history":
                 result = api.get(
                     prefix
@@ -296,7 +307,7 @@ def main(argv=None) -> int:
                         "Save and successfully build the current source before publishing."
                     )
                 body = {"expected_generation": state["state_generation"]}
-                result = api.post(
+                result = api.activate(
                     f'{prefix}/versions/{build["version_id"]}/activate',
                     body,
                     key=workspace.operation(
@@ -318,7 +329,7 @@ def main(argv=None) -> int:
                 if not args.source_only:
                     body["deployment_only"] = args.deployment_only
                 resource = "revisions" if args.source_only else "versions"
-                result = api.post(
+                result = api.activate(
                     f"{prefix}/{resource}/{args.id}/restore",
                     body,
                     key=workspace.operation(

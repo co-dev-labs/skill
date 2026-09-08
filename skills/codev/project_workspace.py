@@ -16,6 +16,7 @@ from project_files import (
     always_excluded,
     collect_files,
     content_digest,
+    read_backend,
     validate_path,
     validate_tree,
 )
@@ -70,6 +71,10 @@ class Workspace:
             "revision_id": manifest["revision_id"] if manifest else None,
             "content_digest": manifest["content_digest"] if manifest else None,
             "build_config": config,
+            "backend_definition": (
+                manifest.get("backend_definition") if manifest else None
+            ),
+            "backend_local_definition": read_backend(self.root),
         }
         self.write()
         # Kept outside the source snapshot, so this trusted guide cannot
@@ -102,8 +107,14 @@ class Workspace:
 
     def dirty(self) -> bool:
         return content_digest(
-            self.files(), self.state["build_config"]
-        ) != self.state.get("content_digest")
+            self.files(),
+            self.state["build_config"],
+            self.state.get("backend_definition"),
+        ) != self.state.get("content_digest") or read_backend(
+            self.root
+        ) != self.state.get(
+            "backend_local_definition"
+        )
 
 
 def validate_manifest(manifest: dict) -> None:
@@ -121,7 +132,12 @@ def validate_manifest(manifest: dict) -> None:
             raise ValueError(
                 "Source snapshot contains a protected path or oversized file."
             )
-    if content_digest(files, manifest["build_config"]) != manifest["content_digest"]:
+    if (
+        content_digest(
+            files, manifest["build_config"], manifest.get("backend_definition")
+        )
+        != manifest["content_digest"]
+    ):
         raise ValueError("Source manifest digest does not match its contents.")
 
 
@@ -129,6 +145,8 @@ def materialize(api, manifest: dict, destination: Path) -> None:
     """Write only into a new directory, verifying every byte before rename."""
     validate_manifest(manifest)
     destination.mkdir(mode=0o700)  # Never overwrite an existing workspace.
+    if manifest.get("backend_definition") is not None:
+        atomic_json(destination / "codev.backend.json", manifest["backend_definition"])
     files = manifest["files"]
     endpoint = (
         f'/v1/sites/{manifest["site_id"]}/revisions/{manifest["revision_id"]}/downloads'

@@ -30,7 +30,18 @@ EXCLUDED_DIRECTORIES = frozenset(
     }
 )
 EXCLUDED_FILES = frozenset(
-    {".ds_store", ".npmrc", ".yarnrc.yml", ".netrc", ".pypirc", "credentials.json"}
+    {
+        ".ds_store",
+        ".npmrc",
+        ".yarnrc.yml",
+        ".netrc",
+        ".pypirc",
+        "credentials.json",
+        "service-account.json",
+        "id_rsa",
+        "id_ed25519",
+        "codev.backend.json",
+    }
 )
 WINDOWS_RESERVED = frozenset(
     {"con", "prn", "aux", "nul"}
@@ -111,12 +122,21 @@ def always_excluded(path: str, output_directory: str) -> bool:
         return True
     if path == output_directory or path.startswith(output_directory + "/"):
         return True
+    return sensitive_path(path)
+
+
+def sensitive_path(path: str) -> bool:
+    parts = path.casefold().split("/")
     name = parts[-1]
     return (
         name in EXCLUDED_FILES
         or (name.startswith(".env") and name != ".env.example")
+        or (name.startswith(".dev.vars") and name != ".dev.vars.example")
         or name.endswith((".pem", ".key", ".p12", ".pfx"))
-        or path.startswith((".claude/", ".codex/", ".agents/"))
+        or any(
+            part in {".git", ".codev", ".aws", ".ssh", ".claude", ".codex", ".agents"}
+            for part in parts
+        )
     )
 
 
@@ -193,13 +213,44 @@ def collect_files(root: Path, output_directory: str = "dist") -> list[dict]:
     return sorted(result, key=lambda file: file["path"])
 
 
-def content_digest(files: list[dict], build_config: dict) -> str:
+def content_digest(
+    files: list[dict], build_config: dict, backend_definition: dict | None = None
+) -> str:
     canonical = {
         "files": sorted(files, key=lambda file: file["path"]),
         "build_config": build_config,
     }
+    if backend_definition is not None:
+        canonical["backend_definition"] = backend_definition
     return hashlib.sha256(
         json.dumps(
             canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
     ).hexdigest()
+
+
+def read_backend(directory: Path) -> dict | None:
+    path = directory / "codev.backend.json"
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Backend configuration must be a regular local file.")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        raw = stream.read(65537)
+    if len(raw) > 65536:
+        raise ValueError("Backend configuration exceeds 64 KiB.")
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        raise ValueError("Backend configuration must contain valid JSON.") from None
+    if not isinstance(value, dict) or set(value) - {
+        "version",
+        "collections",
+        "routes",
+        "public_variables",
+    }:
+        raise ValueError(
+            "Backend configuration contains unsupported properties. Enter secret values through backend.py secret-set."
+        )
+    return value

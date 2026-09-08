@@ -12,6 +12,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from auth import USER_AGENT
 from project_files import local_source_path
 from publish import ApiError, PublishError
 
@@ -40,15 +41,26 @@ class ProjectAPI:
         self.token = token
         self.opener = urllib.request.build_opener(NoRedirect)
 
-    def request(self, method: str, path: str, body=None, *, key: str | None = None):
+    def request(
+        self,
+        method: str,
+        path: str,
+        body=None,
+        *,
+        key: str | None = None,
+        revision: int | None = None,
+    ):
         if not path.startswith("/v1/") or path.startswith("//"):
             raise ValueError("Unexpected API resource path.")
         headers = {
             "Accept": "application/json",
+            "User-Agent": USER_AGENT,
             "Authorization": f"Bearer {self.token}",
         }
         if key:
             headers["Idempotency-Key"] = key
+        if revision is not None:
+            headers["If-Match"] = f'"{revision}"'
         data = None
         if body is not None:
             headers["Content-Type"] = "application/json"
@@ -87,6 +99,65 @@ class ProjectAPI:
 
     def post(self, path: str, body, *, key: str | None = None):
         return self.request("POST", path, body, key=key)
+
+    def activate(self, path, body, *, key=None, wait_seconds=900):
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                return self.post(path, body, key=key)
+            except ApiError as error:
+                if (
+                    error.detail.get("code") != "checkpoint_pending"
+                    or time.monotonic() >= deadline
+                ):
+                    raise
+                print(
+                    "Waiting for the deployment's data checkpoint to be verified...",
+                    file=__import__("sys").stderr,
+                    flush=True,
+                )
+                time.sleep(5)
+
+    def download(self, path, destination, *, max_bytes=1073741824):
+        import tempfile
+
+        if not path.startswith("/v1/") or path.startswith("//"):
+            raise ValueError("Unexpected download path.")
+        destination = Path(destination)
+        if destination.exists() or destination.is_symlink():
+            raise ValueError(
+                "Choose a new export file; existing files are never overwritten."
+            )
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=".codev-download-", dir=destination.parent
+        )
+        try:
+            request = urllib.request.Request(
+                self.origin + path,
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "User-Agent": USER_AGENT,
+                },
+            )
+            with (
+                os.fdopen(descriptor, "wb") as output,
+                self.opener.open(request, timeout=120) as response,
+            ):
+                size = 0
+                while chunk := response.read(1048576):
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise ValueError(
+                            "Export exceeds the configured download limit."
+                        )
+                    output.write(chunk)
+            from import_data import validate_archive
+
+            validate_archive(temporary, max_bytes)
+            os.link(temporary, destination)
+        finally:
+            os.unlink(temporary)
+        return {"file": str(destination), "bytes": size, "verified": True}
 
 
 def upload_verified(uploads: list[dict], files: list[dict], directory: Path) -> None:

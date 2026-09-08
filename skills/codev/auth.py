@@ -26,6 +26,7 @@ from pathlib import Path
 
 EDITING_SCOPES = {"sites:read", "sites:edit", "sources:read", "sources:write"}
 DEFAULT_API_URL = "https://api.co.dev"
+USER_AGENT = "codev/1.0"
 
 
 class AuthError(Exception):
@@ -35,8 +36,8 @@ class AuthError(Exception):
         self.detail = detail
 
 
-def event(status: str, **detail) -> None:
-    print(json.dumps({"event": status, **detail}), file=sys.stderr, flush=True)
+def event(name: str, **detail) -> None:
+    print(json.dumps({"event": name, **detail}), file=sys.stderr, flush=True)
 
 
 def trusted_origin(value: str) -> str:
@@ -70,7 +71,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def request(origin: str, path: str, body=None, *, token=None, method=None):
     origin = trusted_origin(origin)
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if body is not None:

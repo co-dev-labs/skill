@@ -25,12 +25,14 @@ import hashlib
 import json
 import mimetypes
 import os
+import stat
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 DEFAULT_API_URL = "https://api.co.dev"
@@ -125,10 +127,10 @@ def request(
     timeout: int = REQUEST_TIMEOUT,
 ):
     """JSON request; returns the parsed body. Raises ApiError on 4xx/5xx."""
-    from auth import NoRedirect
+    from auth import USER_AGENT, NoRedirect
 
     data = json.dumps(body).encode() if body is not None else None
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if data is not None:
         headers["Content-Type"] = "application/json"
     if token:
@@ -183,31 +185,88 @@ def source_project_root(directory: Path) -> Path | None:
     return None
 
 
+@contextmanager
+def open_output_file(directory: Path, relative: str):
+    """Open through directory descriptors so symlink swaps cannot escape output."""
+    parts = PurePosixPath(relative).parts
+    if (
+        not parts
+        or relative.startswith("/")
+        or "\\" in relative
+        or any(p in (".", "..") for p in relative.split("/"))
+    ):
+        raise PublishError("Invalid output path", EXIT_USAGE)
+    if os.open not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+        raise PublishError(
+            "This platform cannot safely open output files without following links",
+            EXIT_USAGE,
+        )
+    descriptors = []
+    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        parent = os.open(directory, flags)
+        descriptors.append(parent)
+        for part in parts[:-1]:
+            parent = os.open(part, flags, dir_fd=parent)
+            descriptors.append(parent)
+        descriptor = os.open(
+            parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent
+        )
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise PublishError(
+                    "Only regular output files can be published", EXIT_USAGE
+                )
+            yield handle
+    except OSError as exc:
+        raise PublishError(
+            "Output must contain only regular files and directories, without symlinks",
+            EXIT_USAGE,
+        ) from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def build_manifest(directory: Path) -> list[dict]:
     """Hash every file under `directory`; paths are relative and POSIX."""
-    if not directory.is_dir():
+    if directory.is_symlink() or not directory.is_dir():
         raise PublishError(f"{directory} is not a directory", EXIT_USAGE)
     entries: list[dict] = []
+    try:
+        from project_files import sensitive_path
+    except ImportError:
+        from api.skill.project_files import sensitive_path
     for root, dirs, files in os.walk(directory):
+        if any((Path(root) / name).is_symlink() for name in dirs):
+            raise PublishError("Output directories cannot be symlinks", EXIT_USAGE)
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
         for name in sorted(files):
             if name in SKIP_FILES:
                 continue
             full = Path(root) / name
             relative = PurePosixPath(full.relative_to(directory).as_posix())
+            if str(relative) == "codev.backend.json":
+                continue
+            if sensitive_path(str(relative)):
+                raise PublishError(
+                    "Publish output contains a private configuration or credential path.",
+                    EXIT_USAGE,
+                )
             if relative.parts and relative.parts[0] == RESERVED_PREFIX:
                 raise PublishError(
                     f"{relative} is under the reserved {RESERVED_PREFIX}/ folder",
                     EXIT_USAGE,
                 )
             digest = hashlib.sha256()
-            with open(full, "rb") as handle:
+            with open_output_file(directory, str(relative)) as handle:
+                size = os.fstat(handle.fileno()).st_size
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                     digest.update(chunk)
             entries.append(
                 {
                     "path": str(relative),
-                    "size": full.stat().st_size,
+                    "size": size,
                     "content_type": content_type_for(full),
                     "sha256": digest.hexdigest(),
                 }
@@ -227,15 +286,20 @@ def request_manifest(
     spa: bool | None,
     base_version: str | None,
     token: str | None,
+    backend_definition: dict | None = None,
 ) -> dict:
     if site:
         body: dict = {"files": files}
+        if backend_definition is not None:
+            body["backend_definition"] = backend_definition
         if spa is not None:
             body["spa_mode"] = spa
         if base_version:
             body["base_version_id"] = base_version
         return request("POST", f"{base_url}/v1/sites/{site}/versions", body, token)
     body = {"files": files, "spa_mode": bool(spa)}
+    if backend_definition is not None:
+        body["backend_definition"] = backend_definition
     if slug:
         body["slug"] = slug
     if name:
@@ -243,8 +307,16 @@ def request_manifest(
     return request("POST", f"{base_url}/v1/publishes", body, token)
 
 
-def put_file(upload: dict, directory: Path) -> None:
-    data = (directory / upload["path"]).read_bytes()
+def put_file(upload: dict, directory: Path, expected: dict) -> None:
+    with open_output_file(directory, upload["path"]) as handle:
+        data = handle.read(expected["size"] + 1)
+    if (
+        len(data) != expected["size"]
+        or hashlib.sha256(data).hexdigest() != expected["sha256"]
+    ):
+        raise PublishError(
+            "Output changed after hashing. Rebuild and retry.", EXIT_USAGE
+        )
     last_error: Exception | None = None
     for attempt in range(1, UPLOAD_ATTEMPTS + 1):
         req = urllib.request.Request(
@@ -268,11 +340,20 @@ def put_file(upload: dict, directory: Path) -> None:
     raise PublishError(f"Upload of {upload['path']} failed: {last_error}", EXIT_UPLOAD)
 
 
-def upload_all(uploads: list[dict], directory: Path, concurrency: int) -> None:
+def upload_all(
+    uploads: list[dict], directory: Path, concurrency: int, files: list[dict]
+) -> None:
     if not uploads:
         return
+    expected = {file["path"]: file for file in files}
+    if any(upload["path"] not in expected for upload in uploads):
+        raise PublishError(
+            "The server requested a file outside the manifest", EXIT_USAGE
+        )
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-        for _ in pool.map(lambda u: put_file(u, directory), uploads):
+        for _ in pool.map(
+            lambda u: put_file(u, directory, expected[u["path"]]), uploads
+        ):
             pass
 
 
@@ -296,7 +377,18 @@ def finalize(
     if not activate:
         body["activate"] = False
     try:
-        return request("POST", url, body or None, token)
+        deadline = time.monotonic() + 900
+        while True:
+            try:
+                return request("POST", url, body or None, token)
+            except ApiError as error:
+                if (
+                    error.detail.get("code") != "checkpoint_pending"
+                    or time.monotonic() >= deadline
+                ):
+                    raise
+                log("Waiting for the deployment's data checkpoint to be verified...")
+                time.sleep(5)
     except ApiError as exc:
         if exc.exit_code in (EXIT_CONFLICT, EXIT_AUTH):
             raise
@@ -387,19 +479,25 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         base_url = trusted_origin(api_url(args.base_url))
-        directory = Path(args.directory).resolve()
+        directory = Path(args.directory).absolute()
+        if directory.is_symlink():
+            raise PublishError("The output directory cannot be a symlink", EXIT_USAGE)
+        directory = directory.parent.resolve() / directory.name
         source_root = source_project_root(directory)
         if source_root is not None and (
             source_root == directory or not args.output_only
         ):
             raise PublishError(
                 "This is a React/Vite or saved source project. Use project.py init, save, "
-                "build --trust, and publish from its source root so the site can be edited "
+                "review-build, then build --trust and publish from its source root so the site can be edited "
                 "on another computer. For an intentional built-files-only upload, publish "
                 "the output folder with --output-only; it will not save source.",
                 EXIT_USAGE,
             )
         files = build_manifest(directory)
+        from project_files import read_backend
+
+        backend = read_backend(directory)
         if args.site and not args.base_version and not args.preview:
             raise PublishError(
                 "Pass --base-version from the site's state before editing. Resolve the site first; do not overwrite intervening changes.",
@@ -446,13 +544,14 @@ def main(argv: list[str] | None = None) -> int:
             spa=args.spa,
             base_version=args.base_version,
             token=token,
+            backend_definition=backend,
         )
         uploads = created.get("uploads") or []
         log(
             f"Uploading {len(uploads)} files "
             f"({len(created.get('skipped') or [])} already stored)"
         )
-        upload_all(uploads, directory, args.concurrency)
+        upload_all(uploads, directory, args.concurrency, files)
 
         finalize_token = token or created.get("publish_token")
         finalized = finalize(
