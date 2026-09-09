@@ -182,6 +182,30 @@ An app that only needs an API key can have routes without any data collections.
 The shipped `backend.py` command manages configuration, write-only secrets, records, backups, and recovery.
 Run `python3 "<skill folder>/backend.py" --help` for the command contract.
 Backend and data commands require explicit site-scoped permissions; ordinary editing grants do not silently gain them.
+Before building against a backend definition, run `python3 "<skill folder>/backend.py" validate --file codev.backend.json`.
+Validation uses the trusted Codev API's exact contract and needs no app ID, sign-in, or saved credential.
+`project.py init` and `save`, `backend.py config-save`, and the output publisher also validate before requesting a connection.
+The definition is limited to 64 KiB, 20 collections, 50 fields per collection, and 10 indexed fields per collection.
+Field `max_length` cannot exceed 16384; model growing data as bounded records instead of one unbounded serialized collection.
+Read `/v1/backend/schema` for the complete contract.
+
+Saving source preserves the proposed backend definition without approving access policies or changing the active app.
+Use `project.py --connect publish` after saving, reviewing, building, and previewing the app.
+When activation needs backend-management permission, this command requests consent for that app and resumes the same saved build automatically.
+For direct backend operations, use `backend.py --connect config-save` or the required command.
+It requests only the operation's backend permission for the attached app.
+The browser names the account, app, agent, permissions, and duration before the user approves.
+An existing remembered connection receives the approved permissions directly; credentials stay inside the helper and OS credential store.
+Future commands and chats reuse that access until the user removes it in the app's Backend settings or disconnects the agent.
+`backend.py --temporary --connect ...` keeps any newly granted access only in the active command, with an eight-hour server expiry, while preserving the saved connection's permissions.
+
+Give the user the exact approval link and matching code, then keep the command polling.
+The user completes consent directly in Codev using their preferred browser or device.
+Do not ask which browser is signed in, inspect unrelated browser tabs, create dashboard API keys, copy credentials, or invent a local key importer for this workflow.
+Do not ask for another chat confirmation of an authorization the user has already provided.
+Follow any actual tool approval rejection, but do not turn it into an additional product consent step or retry a rejected action through another tool.
+The supported recovery is the user-facing Codev approval link and the waiting helper.
+An explicit `CODEV_API_KEY` remains authoritative and never silently starts a permission upgrade; manage advanced automation keys explicitly in the dashboard.
 
 Keep `codev.backend.json` at the source root.
 It declares version 1, `routes`, `collections`, and explicitly public `public_variables`, and contains secret names only.
@@ -246,6 +270,7 @@ Denial, cancellation, or expiry stops the pending connection without changing th
 Do not open another approval request until the user chooses to continue.
 Network failures preserve the pending request; rerun the same active command to resume.
 A 403, missing source, wrong account, and a revoked connection each need their specific recovery action.
+Missing backend permission must request app-specific consent, never another ordinary source-access connection.
 
 ## Manage sites with the API
 

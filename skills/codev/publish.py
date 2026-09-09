@@ -495,9 +495,10 @@ def main(argv: list[str] | None = None) -> int:
                 EXIT_USAGE,
             )
         files = build_manifest(directory)
-        from project_files import read_backend
+        from project_files import read_backend, validate_backend
 
         backend = read_backend(directory)
+        validate_backend(base_url, backend)
         if args.site and not args.base_version and not args.preview:
             raise PublishError(
                 "Pass --base-version from the site's state before editing. Resolve the site first; do not overwrite intervening changes.",
@@ -554,13 +555,39 @@ def main(argv: list[str] | None = None) -> int:
         upload_all(uploads, directory, args.concurrency, files)
 
         finalize_token = token or created.get("publish_token")
-        finalized = finalize(
-            base_url,
-            created["finalize_url"],
-            finalize_token,
-            args.base_version,
-            activate=not args.preview,
-        )
+        try:
+            finalized = finalize(
+                base_url,
+                created["finalize_url"],
+                finalize_token,
+                args.base_version,
+                activate=not args.preview,
+            )
+        except ApiError as error:
+            if error.detail.get("code") != "backend_scope_required":
+                raise
+            finalize_token = get_token(
+                base_url,
+                explicit=args.api_key,
+                connect=args.connect or args.pair,
+                account=args.account,
+                temporary=args.temporary,
+                open_browser=args.open_browser,
+                task=args.task,
+                required_scopes={"sites:edit", f"backend:manage:{created['site_id']}"},
+            )
+            if not finalize_token:
+                raise AuthError(
+                    "backend_scope_required",
+                    "Connect to approve backend access for this app before publishing.",
+                )
+            finalized = finalize(
+                base_url,
+                created["finalize_url"],
+                finalize_token,
+                args.base_version,
+                activate=not args.preview,
+            )
         log("Preview ready." if args.preview else "Published.")
 
         result.update(

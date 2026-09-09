@@ -19,9 +19,9 @@ from auth import EDITING_SCOPES, AuthError, event, get_token
 from auth import request as auth_request
 from project_api import ProjectAPI, upload_verified
 from project_build import review_build, run_build, tool_version
-from project_files import read_backend, validate_path
+from project_files import read_backend, validate_backend, validate_path
 from project_workspace import Workspace, materialize
-from publish import PublishError, api_url
+from publish import ApiError, PublishError, api_url
 
 
 def save(api, workspace: Workspace, summary: str) -> dict:
@@ -211,6 +211,8 @@ def main(argv=None) -> int:
             raise ValueError(
                 "This workspace belongs to a different Codev API. Select its trusted origin explicitly with --api."
             )
+        if args.command in {"init", "save"}:
+            validate_backend(origin, read_backend(workspace.root))
         if args.command in ("init", "open"):
             capability = auth_request(origin, "/v1/capabilities")["source_projects"]
             available = (
@@ -307,7 +309,10 @@ def main(argv=None) -> int:
                         "Save and successfully build the current source before publishing."
                     )
                 body = {"expected_generation": state["state_generation"]}
-                result = api.activate(
+                result = activate_with_backend_access(
+                    api,
+                    args,
+                    state["site_id"],
                     f'{prefix}/versions/{build["version_id"]}/activate',
                     body,
                     key=workspace.operation(
@@ -329,7 +334,10 @@ def main(argv=None) -> int:
                 if not args.source_only:
                     body["deployment_only"] = args.deployment_only
                 resource = "revisions" if args.source_only else "versions"
-                result = api.activate(
+                result = activate_with_backend_access(
+                    api,
+                    args,
+                    state["site_id"],
                     f"{prefix}/{resource}/{args.id}/restore",
                     body,
                     key=workspace.operation(
@@ -353,6 +361,31 @@ def main(argv=None) -> int:
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
+
+
+def activate_with_backend_access(api, args, site_id, path, body, *, key):
+    try:
+        return api.activate(path, body, key=key)
+    except ApiError as error:
+        if error.detail.get("code") != "backend_scope_required":
+            raise
+    # Only this app's management permission can recover a blocked activation.
+    # The exact saved build and concurrency generation remain unchanged.
+    api.token = get_token(
+        api.origin,
+        connect=args.connect,
+        account=args.account,
+        temporary=args.temporary,
+        open_browser=args.open_browser,
+        task=args.task,
+        required_scopes=EDITING_SCOPES | {f"backend:manage:{site_id}"},
+    )
+    if not api.token:
+        raise AuthError(
+            "backend_scope_required",
+            "Use project.py --connect publish to approve backend access for this app and resume publishing.",
+        )
+    return api.activate(path, body, key=key)
 
 
 if __name__ == "__main__":

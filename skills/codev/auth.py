@@ -97,6 +97,22 @@ def request(origin: str, path: str, body=None, *, token=None, method=None):
         except ValueError:
             payload = {}
         detail = payload if isinstance(payload, dict) else {}
+        if isinstance(payload, list):
+            issues = [
+                ".".join(str(part) for part in item.get("loc", []))
+                + ": "
+                + item.get("msg", "Invalid value")
+                for item in payload
+                if isinstance(item, dict)
+            ]
+            detail = {
+                "code": (
+                    "backend_definition_invalid"
+                    if path == "/v1/backend/validate"
+                    else "request_invalid"
+                ),
+                "message": "; ".join(issues),
+            }
         raise AuthError(
             detail.get("code", f"http_{exc.code}"),
             detail.get(
@@ -122,14 +138,47 @@ def require_scopes(identity: dict, required_scopes) -> None:
         available.add("sites:edit")
     missing = set(required_scopes) - available
     if missing:
+        backend = any(scope.startswith("backend:") for scope in missing)
         raise AuthError(
-            "source_scope_required",
-            "This credential cannot access the requested private source. "
-            "A saved connection can request source access with --connect. "
-            "For an explicit API key, use a key with the required source permissions.",
+            "backend_scope_required" if backend else "source_scope_required",
+            (
+                "This credential needs additional access for this app's backend. Use --connect with a saved agent connection, or update the explicit automation key in the dashboard."
+                if backend
+                else "This credential cannot access the requested private source. "
+                "A saved connection can request source access with --connect. "
+                "For an explicit API key, use a key with the required source permissions."
+            ),
             required_scopes=sorted(required_scopes),
             missing_scopes=sorted(missing),
         )
+
+
+def backend_request(scopes):
+    permissions, sites = set(), set()
+    for scope in scopes:
+        if scope in EDITING_SCOPES:
+            continue
+        parts = scope.split(":")
+        if (
+            len(parts) != 3
+            or parts[0] != "backend"
+            or parts[1] not in {"read", "manage", "secrets", "data"}
+        ):
+            raise AuthError(
+                "scope_unsupported", "This connection cannot request that permission."
+            )
+        try:
+            sites.add(str(uuid.UUID(parts[2])))
+        except ValueError:
+            raise AuthError(
+                "scope_unsupported", "Backend permissions need an exact app ID."
+            ) from None
+        permissions.add(parts[1])
+    if len(sites) > 1:
+        raise AuthError(
+            "scope_unsupported", "Request backend access for one app at a time."
+        )
+    return next(iter(sites), None), sorted(permissions)
 
 
 def config_directory() -> Path:
@@ -341,6 +390,7 @@ class Connections:
             record["supported"] = capability.get(
                 "protocol_version"
             ) == 2 and capability.get("enabled", False)
+            record["backend_permissions"] = capability.get("backend_permissions", [])
         return record
 
     def service(self, record):
@@ -394,6 +444,52 @@ class Connections:
                         "connection_identity_changed",
                         "This saved connection no longer matches its account.",
                     )
+                if (
+                    pending
+                    and pending.get("backend_site_id")
+                    and pending.get("existing_connection_id")
+                    == identity["connection_id"]
+                ):
+                    granted = {
+                        f"backend:{permission}:{pending['backend_site_id']}"
+                        for permission in pending["backend_permissions"]
+                    }
+                    if granted <= set(identity["scopes"]):
+                        # The process may have stopped after the server extended
+                        # this existing key but before it recorded the receipt.
+                        result = request(
+                            self.origin,
+                            "/v1/auth/agent/connections/exchange",
+                            {
+                                key: pending[key]
+                                for key in ("request_id", "device_secret")
+                            },
+                        )
+                        if (
+                            result["status"] == "approved"
+                            and result["key_id"] == identity["connection_id"]
+                        ):
+                            pending["received_account"] = account_id
+                            self.store.call(
+                                "set",
+                                self.service(record),
+                                "pending",
+                                json.dumps(pending),
+                            )
+                            self.finish(
+                                record,
+                                pending,
+                                token,
+                                remembered=True,
+                                identity=identity,
+                            )
+                        elif result["status"] in {
+                            "cancelled",
+                            "denied",
+                            "expired",
+                            "connected",
+                        }:
+                            self.store.call("delete", self.service(record), "pending")
                 if site:
                     request(
                         self.origin,
@@ -401,6 +497,7 @@ class Connections:
                         token=token,
                     )
                 record["selected_account"] = account_id
+                record["accounts"][account_id]["scopes"] = identity["scopes"]
                 if site:
                     record["sites"][site] = account_id
                 self.write()
@@ -439,12 +536,20 @@ class Connections:
         open_browser=False,
         claim_token=None,
         existing_token=None,
+        backend_site_id=None,
+        backend_permissions=(),
     ):
         if not record.get("supported"):
             raise AuthError(
                 "connections_unavailable",
                 "This Codev server needs the current connection protocol. Existing CODEV_API_KEY automation still works.",
             )
+        if set(backend_permissions) - set(record.get("backend_permissions", [])):
+            raise AuthError(
+                "backend_connection_unavailable",
+                "This Codev server does not support app-specific backend consent yet. Update the server; reconnecting for source access will not help.",
+            )
+        claim_only = bool(existing_token) and not backend_site_id
         pending = None
         service = self.service(record)
         if not temporary:
@@ -459,8 +564,10 @@ class Connections:
         if pending and (
             pending.get("site") != site
             or pending.get("task_label") != task
-            or pending.get("claim_only", False) != bool(existing_token)
+            or pending.get("claim_only", False) != claim_only
             or bool(pending.get("claim_token")) != bool(claim_token)
+            or pending.get("backend_site_id") != backend_site_id
+            or pending.get("backend_permissions", []) != list(backend_permissions)
         ):
             # A new active task must not silently resume a different ownership journey.
             request(
@@ -483,16 +590,27 @@ class Connections:
                 "site": site,
                 "task_label": task,
                 "claim_token": claim_token,
-                "claim_only": bool(existing_token),
+                "claim_only": claim_only,
                 "remember": not temporary,
             }
+            if backend_site_id:
+                pending.update(
+                    backend_site_id=backend_site_id,
+                    backend_permissions=list(backend_permissions),
+                )
+                if existing_token:
+                    pending["existing_connection_id"] = request(
+                        self.origin, "/v1/auth/agent/identity", token=existing_token
+                    )["connection_id"]
             # Persist BEFORE making the request. A lost start response can be replayed.
             if not temporary:
                 self.store.call("set", service, "pending", json.dumps(pending))
                 self.write()
         device = {key: pending[key] for key in ("request_id", "device_secret")}
         body = {
-            key: value for key, value in pending.items() if key != "received_account"
+            key: value
+            for key, value in pending.items()
+            if key not in {"received_account", "existing_connection_id"}
         }
         try:
             started = request(
@@ -510,9 +628,13 @@ class Connections:
             verify_url=started["verify_url"],
             user_code=started["user_code"],
             message=(
-                "Save this site to your connected account in the browser; the task continues automatically."
-                if existing_token
-                else "Connect Codev once to edit all your sites. Approve in the browser; the task continues automatically."
+                "Approve the requested backend permissions for this app in Codev; this command continues automatically."
+                if backend_site_id
+                else (
+                    "Save this site to your connected account in the browser; the task continues automatically."
+                    if existing_token
+                    else "Connect Codev once to edit all your sites. Approve in the browser; the task continues automatically."
+                )
             ),
         )
         url = urllib.parse.urlsplit(started["verify_url"])
@@ -558,7 +680,7 @@ class Connections:
                         f"connection_{status}",
                         f"Connection {status}. Your pending edits have not been published.",
                     )
-                token = existing_token or result["api_key"]
+                token = result.get("api_key") or existing_token
                 remembered = not temporary
                 identity = request(self.origin, "/v1/auth/agent/identity", token=token)
                 if remembered:
@@ -608,6 +730,14 @@ class Connections:
                     "connection_request_finished",
                 ):
                     raise
+                if (
+                    pending.get("existing_connection_id")
+                    and exc.detail.get("status") != 401
+                ):
+                    # Expiring a grant receipt must not discard the underlying
+                    # remembered editing connection, whose token is unchanged.
+                    self.store.call("delete", self.service(record), "pending")
+                    return token
         self.store.call("delete", self.service(record), "pending")
         self.store.call("delete", self.service(record), account_id)
         record["accounts"].pop(account_id, None)
@@ -687,6 +817,7 @@ def get_token(
         if not claim_token:
             return token
     manager = manager or Connections(origin)
+    backend_site_id, backend_permissions = backend_request(required_scopes)
     with manager.lock():
         if not connect and manager.origin not in manager.state["origins"]:
             return None
@@ -703,6 +834,24 @@ def get_token(
                 )
             )
         except AuthError as exc:
+            if exc.code == "backend_scope_required" and connect:
+                token = manager.saved(record, account=account, site=site)
+                token = manager.connect(
+                    record,
+                    site=None,
+                    task=task,
+                    temporary=temporary,
+                    open_browser=open_browser,
+                    name=name,
+                    existing_token=token,
+                    backend_site_id=backend_site_id,
+                    backend_permissions=backend_permissions,
+                )
+                require_scopes(
+                    request(origin, "/v1/auth/agent/identity", token=token),
+                    required_scopes,
+                )
+                return token
             if exc.code != "source_scope_required" or not connect:
                 raise
             event(
@@ -726,15 +875,21 @@ def get_token(
             return token
         if not connect:
             return None
-        return manager.connect(
+        token = manager.connect(
             record,
-            site=site,
+            site=None if backend_site_id else site,
             task=task,
             temporary=temporary,
             open_browser=open_browser,
             name=name,
             claim_token=claim_token,
+            backend_site_id=backend_site_id,
+            backend_permissions=backend_permissions,
         )
+        require_scopes(
+            request(origin, "/v1/auth/agent/identity", token=token), required_scopes
+        )
+        return token
 
 
 def main(argv=None):

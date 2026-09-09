@@ -17,7 +17,9 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from auth import AuthError, event, get_token
+from auth import request as auth_request
 from project_api import ProjectAPI
+from project_files import validate_backend
 from project_workspace import Workspace
 from publish import PublishError, api_url
 
@@ -83,6 +85,7 @@ def parser():
     result.add_argument("--connect", action="store_true")
     result.add_argument("--account")
     result.add_argument("--open-browser", action="store_true")
+    result.add_argument("--temporary", action="store_true")
     commands = result.add_subparsers(dest="command", required=True)
     for name in (
         "status",
@@ -96,6 +99,11 @@ def parser():
         commands.add_parser(name)
     config = commands.add_parser("config-save")
     config.add_argument("--file", type=Path, default=Path("codev.backend.json"))
+    validation = commands.add_parser(
+        "validate",
+        help="validate a backend definition before connecting; no app or credential required",
+    )
+    validation.add_argument("--file", type=Path, default=Path("codev.backend.json"))
     for name in ("secret-set", "secret-revoke"):
         command = commands.add_parser(name)
         command.add_argument("name")
@@ -368,6 +376,19 @@ def main(argv=None):
             and workspace.state["api_origin"] != origin
         ):
             raise CommandError("Select this workspace's trusted API origin explicitly.")
+        if args.command in {"validate", "config-save"}:
+            if not args.file.is_absolute():
+                args.file = args.directory / args.file
+            validation = validate_backend(origin, document(args.file, limit=65536))
+            if args.command == "validate":
+                print(json.dumps(validation))
+                return 0
+        if (
+            not auth_request(origin, "/v1/capabilities")
+            .get("managed_backend", {})
+            .get("enabled")
+        ):
+            raise CommandError("Managed backends are not enabled on this Codev server.")
         site = str(UUID(args.site or workspace.state.get("site_id", "")))
         permission = "data"
         if args.command in {"status", "config-get", "secrets", "compatibility"}:
@@ -381,15 +402,14 @@ def main(argv=None):
             connect=args.connect,
             account=args.account,
             open_browser=args.open_browser,
+            temporary=args.temporary,
             required_scopes={f"backend:{permission}:{site}"},
         )
         if not token:
             raise CommandError(
-                "Use a Codev key with this site's explicit backend permission. Create one in the app's Backend settings."
+                "Run this command with --connect to approve backend access for this app in Codev. For advanced automation, supply an explicit CODEV_API_KEY with the required app permission."
             )
         api = ProjectAPI(origin, token)
-        if not api.get("/v1/capabilities").get("managed_backend", {}).get("enabled"):
-            raise CommandError("Managed backends are not enabled on this Codev server.")
         result = execute(api, f"/v1/sites/{site}/backend/{args.environment}", args)
         print(json.dumps(result, indent=2))
         return 0

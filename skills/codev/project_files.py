@@ -254,3 +254,20 @@ def read_backend(directory: Path) -> dict | None:
             "Backend configuration contains unsupported properties. Enter secret values through backend.py secret-set."
         )
     return value
+
+
+def validate_backend(origin: str, definition: dict | None):
+    """Use the server's exact contract before connecting or creating an app."""
+    if definition is None:
+        return None
+    from auth import AuthError, request
+
+    try:
+        return request(origin, "/v1/backend/validate", definition)
+    except AuthError as error:
+        if error.detail.get("status") == 404:
+            raise AuthError(
+                "backend_validation_unavailable",
+                "This Codev server needs the backend validation endpoint. Update it before configuring this app.",
+            ) from None
+        raise
