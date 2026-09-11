@@ -300,10 +300,16 @@ Errors come back as `{"detail": {"code": "...", "message": "..."}}`; the codes t
 | Roll back to a version | `curl -sS -X POST "$API/v1/sites/<site_id>/versions/<version_id>/restore" -H "$AUTH"` |
 | Set a password | `curl -sS -X PUT "$API/v1/sites/<site_id>/access" -H "$AUTH" -H 'Content-Type: application/json' -d '{"mode": "password", "password": "open-sesame"}'` |
 | Restrict to emails | the same call with `{"mode": "restricted", "allowed_emails": ["a@example.com"]}`; `{"mode": "public"}` opens it again |
+| Attach a custom domain | `curl -sS -X POST "$API/v1/sites/<site_id>/domains" -H "$AUTH" -H 'Content-Type: application/json' -d '{"hostname": "www.example.com"}'`; the response's `cname` is the DNS record the user must create |
+| List domains | `curl -sS "$API/v1/sites/<site_id>/domains" -H "$AUTH"` |
+| Check a domain again | `curl -sS -X POST "$API/v1/sites/<site_id>/domains/<domain_id>/verify" -H "$AUTH"` |
+| Remove a domain | `curl -sS -X DELETE "$API/v1/sites/<site_id>/domains/<domain_id>" -H "$AUTH"` |
 | New version by hand | `POST "$API/v1/sites/<site_id>/versions"` with the same body as `/v1/publishes`, then upload and finalize |
 
+Custom domains exist only when `GET $API/v1/capabilities` reports `custom_domains.enabled`; otherwise the domain calls answer `custom_domains_unavailable`.
+Other domain errors are `hostname_invalid`, `hostname_reserved`, `domain_taken` and `domain_limit`.
 A key cannot claim a site, create or revoke keys, or approve a pairing; those need the signed-in user on the dashboard.
-The standard editing connection also excludes site deletion and access-policy changes.
+The standard editing connection also excludes site deletion, access-policy changes and custom domains.
 Use the dashboard for those explicitly requested operations; do not broaden the editing grant silently.
 Trash preserves data, encrypted secrets, source, assets, and version history for seven days.
 Permanent deletion removes app-owned storage and backups after outstanding upload links expire, while files referenced by other apps remain.
@@ -314,6 +320,7 @@ Report permanent deletion as queued until the app disappears from Trash; do not 
 - Always give the `site_url`.
 - For an anonymous site, also give the claim link and say when it expires.
 - After an access change, say what a visitor will now see.
+- After attaching a domain, give the CNAME name and target from the response and say the site is only reachable there once its `status` is `verified`; never claim a custom domain is live before that.
 - After an update, verify the actual URL before saying the result is live.
 - If publishing succeeded but verification could not finish, say so accurately and inspect the current version before retrying publication.
 - Never paste an API key into a file, a commit, or a message the user did not ask for.
